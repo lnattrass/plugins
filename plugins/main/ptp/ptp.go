@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 
 	"github.com/j-keck/arping"
@@ -82,36 +83,63 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Resu
 
 		pr.Interfaces = []*current.Interface{hostInterface, containerInterface}
 
-		link, err := netlink.LinkByName(ifName)
-		if err != nil {
-			return fmt.Errorf("failed to look up %q: %v", ifName, err)
+		if err = ipam.ConfigureIface(ifName, pr); err != nil {
+			return err
 		}
 
-		if err := netlink.LinkSetUp(link); err != nil {
-			return fmt.Errorf("failed to set %q UP: %v", ifName, err)
-		}
-
-		for _, ipc := range pr.IPs {
-			maskLen := 128
-			if ipc.Address.IP.To4() != nil {
-				maskLen = 32
-			}
-
-			hostVethIP := &net.IPNet{
-				IP:   ipc.Gateway,
-				Mask: net.CIDRMask(maskLen, maskLen),
-			}
-			addr := &netlink.Addr{IPNet: &ipc.Address, Peer: hostVethIP}
-			if err = netlink.AddrAdd(link, addr); err != nil {
-				return fmt.Errorf("failed to add IP addr (%#v) peer (%#v) to veth: %v", ipc.Address, hostVethIP, err)
-			}
-		}
-
-		// Send a gratuitous arp for all v4 addresses
 		contVeth, err := net.InterfaceByName(ifName)
 		if err != nil {
 			return fmt.Errorf("failed to look up %q: %v", ifName, err)
 		}
+
+		for _, ipc := range pr.IPs {
+			// Delete the route that was automatically added
+			route := netlink.Route{
+				LinkIndex: contVeth.Index,
+				Dst: &net.IPNet{
+					IP:   ipc.Address.IP.Mask(ipc.Address.Mask),
+					Mask: ipc.Address.Mask,
+				},
+				Scope: netlink.SCOPE_NOWHERE,
+			}
+
+			if err := netlink.RouteDel(&route); err != nil {
+				return fmt.Errorf("failed to delete route %v: %v", route, err)
+			}
+
+			addrBits := 32
+			if ipc.Version == "6" {
+				addrBits = 128
+			}
+
+			for _, r := range []netlink.Route{
+				{
+					LinkIndex: contVeth.Index,
+					Dst: &net.IPNet{
+						IP:   ipc.Gateway,
+						Mask: net.CIDRMask(addrBits, addrBits),
+					},
+					Scope: netlink.SCOPE_LINK,
+					Src:   ipc.Address.IP,
+				},
+				{
+					LinkIndex: contVeth.Index,
+					Dst: &net.IPNet{
+						IP:   ipc.Address.IP.Mask(ipc.Address.Mask),
+						Mask: ipc.Address.Mask,
+					},
+					Scope: netlink.SCOPE_UNIVERSE,
+					Gw:    ipc.Gateway,
+					Src:   ipc.Address.IP,
+				},
+			} {
+				if err := netlink.RouteAdd(&r); err != nil {
+					return fmt.Errorf("failed to add route %v: %v", r, err)
+				}
+			}
+		}
+
+		// Send a gratuitous arp for all v4 addresses
 		for _, ipc := range pr.IPs {
 			if ipc.Version == "4" {
 				_ = arping.GratuitousArpOverIface(ipc.Address.IP, *contVeth)
@@ -139,16 +167,23 @@ func setupHostVeth(vethName string, result *current.Result) error {
 			maskLen = 32
 		}
 
-		hostVethIP := &net.IPNet{
+		ipn := &net.IPNet{
 			IP:   ipc.Gateway,
 			Mask: net.CIDRMask(maskLen, maskLen),
 		}
-
-		addr := &netlink.Addr{IPNet: hostVethIP, Peer: &ipc.Address}
+		addr := &netlink.Addr{IPNet: ipn, Label: ""}
 		if err = netlink.AddrAdd(veth, addr); err != nil {
-			return fmt.Errorf("failed to add IP addr (%#v) peer (%#v) to veth: %v", hostVethIP, ipc.Address, err)
+			return fmt.Errorf("failed to add IP addr (%#v) to veth: %v", ipn, err)
 		}
 
+		ipn = &net.IPNet{
+			IP:   ipc.Address.IP,
+			Mask: net.CIDRMask(maskLen, maskLen),
+		}
+		// dst happens to be the same as IP/net of host veth
+		if err = ip.AddHostRoute(ipn, nil, veth); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("failed to add route on host: %v", err)
+		}
 	}
 
 	return nil
